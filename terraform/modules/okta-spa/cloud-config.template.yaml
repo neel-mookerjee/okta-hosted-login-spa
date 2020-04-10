@@ -1,0 +1,203 @@
+#cloud-config
+
+coreos:
+  units:
+  - name: ui.service
+    command: start
+    content: |
+      [Unit]
+      Requires=docker.service
+      After=docker.service
+
+      [Service]
+      TimeoutSec=0
+      Restart=on-failure
+      RestartSec=30s
+
+      EnvironmentFile=/etc/environment
+      ExecStartPre=-/usr/bin/mkdir -p /okta-spa/logs
+      ExecStartPre=-/usr/bin/mkdir -p /okta-spa/files
+      ExecStartPre=-/usr/bin/docker login -u gitlab-ci-token -p ${gitlab_token} ${docker_image}
+      ExecStartPre=-/usr/bin/docker pull ${docker_image}
+
+      ExecStart=/usr/bin/docker run --rm \
+        --name ui \
+        --log-driver journald \
+        --net=host \
+        --volume /okta-spa/logs:/okta-spa/logs \
+        -p ${application_port}:${application_port} \
+        ${docker_image}
+      ExecStop=-/usr/bin/docker stop ui
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - name: dd-agent.service
+    command: start
+    content: |
+      [Unit]
+        Requires=docker.service
+        After=docker.service
+      [Service]
+        TimeoutSec=0
+        Restart=on-failure
+        RestartSec=30s
+        ExecStart=/usr/bin/docker run \
+          --name datadog \
+          --rm \
+          --net=host \
+          -v /:/host/rootfs:ro \
+          -v /proc/:/host/proc/:ro \
+          -v /var/run/docker.sock:/var/run/docker.sock:ro \
+          -v /proc/mounts:/host/proc/mounts:ro \
+          -v /sys/fs/cgroup/:/host/sys/fs/cgroup:ro \
+          -v /etc/dd-agent/conf.d:/etc/dd-agent/checks.d:ro \
+          -p 9999:9999 \
+          --log-driver journald \
+          -e API_KEY=${datadog_api_key} \
+          -e SD_BACKEND=docker \
+          -e NON_LOCAL_TRAFFIC=false \
+          -e LOG_LEVEL=INFO \
+          -e DD_LOGS_STDOUT=yes \
+          -e EC2_TAGS=yes \
+          -e TAGS=${datadog_tags} \
+          ${ddagent_docker_image}
+        ExecStop=-/usr/bin/docker rm ddagent -f
+      [Install]
+        WantedBy=multi-user.target
+
+  - name: fluent-bit.service
+    command: start
+    content: |
+      [Unit]
+        Requires=docker.service
+        After=docker.service
+
+      [Service]
+        TimeoutSec=0
+        Restart=on-failure
+        RestartSec=10s
+        ExecStartPre=-/usr/bin/docker kill fluent-bit
+        ExecStartPre=-/usr/bin/docker rm fluent-bit
+
+        ExecStart=/usr/bin/docker run --rm \
+          --name fluent-bit \
+          --log-driver journald \
+          -e "STACK_NAME=${stack_name}"  \
+          -e "ENVIRONMENT=${workspace}" \
+          -e "SPLUNK_TOKEN=${splunk_token}" \
+          -v /home/core/fluent-bit:/fluent-bit/etc:ro \
+          -v /var/log:/var/log:ro \
+          -v /tmp/fluent:/tmp \
+            "${fluentbit_docker_image}"
+        ExecStop=/bin/docker rm fluent-bit -f
+      [Install]
+        WantedBy=multi-user.target
+
+write_files:
+  - path: /etc/environment
+    content: |
+      COREOS_PRIVATE_IPV4=$private_ipv4
+      NODE_NAME=${node_name}
+      NODE_TYPE=okta-login
+      DATADOG_API_KEY=${datadog_api_key}
+      DATADOG_TAGS=${datadog_tags}
+
+  - path: /etc/dd-agent/conf.d/disk.d/conf.yaml
+    content: |
+      init_config:
+
+      instances:
+      - use_mount: yes
+
+  - path: /etc/dd-agent/conf.d/system_core.d/conf.yaml
+    content: |
+      init_config:
+
+      instances:
+      - foo: bar
+
+  - path: /home/core/fluent-bit/input.conf
+    content: |
+      [INPUT]
+        Name            systemd
+        Tag             host.*
+        DB              /tmp/cursor.db
+        Path            /var/log/journal
+        Mem_Buf_Limit   5MB
+        Systemd_Filter  _SYSTEMD_UNIT=fluent-bit.service
+        Systemd_Filter  _SYSTEMD_UNIT=datadog.service
+        Systemd_Filter  _SYSTEMD_UNIT=ranger-admin.service
+        Systemd_Filter  _SYSTEMD_UNIT=docker.service
+
+      [INPUT]
+        Name            tail
+        Path            /var/log/*
+        Tag             okta-app-logs
+        path_key        log_file
+        Buffer_Max_Size 10mb
+        Exclude_Path /var/log/cloud-init*
+
+  - path: /home/core/fluent-bit/parsers.conf
+    content: |
+      [PARSER]
+        Name        json_parser
+        Format      json
+
+  - path: /home/core/fluent-bit/fluent-bit.conf
+    content: |
+      @INCLUDE input.conf
+
+      [SERVICE]
+          Flush      1
+          Daemon     Off
+          Log_Level  info
+          Parsers_File parsers.conf
+
+      [FILTER]
+          Name      modify
+          Match     *
+          Rename MESSAGE unparsed.message
+          Rename _HOSTNAME hostname
+          Rename _SYSTEMD_UNIT systemd_unit
+          Add stack_name ${stack_name}
+          Add environment ${workspace}
+
+      [FILTER]
+          Name parser
+          Match *
+          Key_Name unparsed.message
+          Reserve_Data True
+          Parser json_parser
+
+      [FILTER]
+          Name record_modifier
+          Match *
+          Remove_key PRIORITY
+          Remove_key SYSLOG_FACILITY
+          Remove_key _UID
+          Remove_key _GID
+          Remove_key _PID
+          Remove_key _SYSTEMD_SLICE
+          Remove_key _TRANSPORT
+          Remove_key _CAP_EFFECTIVE
+          Remove_key _MACHINE_ID
+          Remove_key _SELINUX_CONTEXT
+          Remove_key _BOOT_ID
+          Remove_key SYSLOG_IDENTIFIER
+          Remove_key _COMM
+          Remove_key _STREAM_ID
+          Remove_key _EXE
+          Remove_key _CMDLINE
+          Remove_key _SYSTEMD_CGROUP
+          Remove_key _SYSTEMD_INVOCATION_ID
+
+      [OUTPUT]
+          Name       splunk
+          Match      *
+          Host       http-inputs-domain.splunkcloud.com
+          Port       443
+          TLS         On
+          TLS.Verify  Off
+          Splunk_Token ${splunk_token}
+          Message_Key unparsed.message
